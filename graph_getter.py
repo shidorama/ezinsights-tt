@@ -1,10 +1,15 @@
+from base64 import b64encode
+from collections import deque
 from datetime import datetime, timedelta
 from json import loads
 from time import time
-from collections import deque, OrderedDict
-from base64 import b64encode
+from typing import List, Tuple, Dict, Union
+
 import requests
+from requests import Request
+
 from graph_generator import generate_graph
+
 # import matplotlib.pyplot as plt
 
 API_KEY = 'EAACEdEose0cBAAHkVLbW94CEDLC0E5UwzwrMZC73Te6rsI6zZAKI7rihUA3MAQ1KGKQ7JHFVgJTJo8TZBzZAmVnQZBNSIThzZCho6UVFhbbCFsiAiZBpafCQ8UJ88wxQvIYr0IX6rAQDlB4xtDDdnDhqDSEMw8F08Qo4BU1CsYJlrPTjuTGOVlaN7hwNQ3Ori4ZD'
@@ -30,24 +35,29 @@ class GetFBTimeseries(object):
         self.__count = 0
 
     @property
-    def total(self):
+    def total(self) -> int:
+        """gets total amount of comments as reported by facebook
+
+        :return:
+        """
         if self.__total is None:
             self.__total = self.get_comment_count()
         return self.__total
 
-    def generate_tokens(self):
-        total = self.total+1
-        while total>0:
+    def generate_tokens(self) -> None:
+        """Generates queue of tokens for use by comments count get
+
+        :return:
+        """
+        total = self.total + 1
+        while total > 0:
             token_string = '%s' % total
             token_bytes = b64encode(token_string.encode()).replace(b'=', b'ZD')
             token = token_bytes.decode()
             self.__tokens.appendleft(token)
             total -= BATCH_SIZE
 
-
-
-
-    def get_comment_count(self):
+    def get_comment_count(self) -> Union[int, bool]:
         params = {
             'access_token': API_KEY,
             'summary': True
@@ -60,49 +70,51 @@ class GetFBTimeseries(object):
         count = data.get('summary', {}).get('total_count', False)
         return count
 
-    def get_posts(self):
+    def get_posts(self) -> Dict[datetime: int]:
+        """Iterates over tokens and calls actual comment fetcher
+
+        :return:
+        """
         self.generate_tokens()
-        params = {
-            'access_token': API_KEY,
-            'limit': BATCH_SIZE,
-        }
         poll_continue = True
         delay = 0
-        start = time()
-        # params['after'] = self.__tokens.pop()
         while poll_continue:
-            x = requests.get(url, params=params)
-            try:
-                data = loads(x.content)
-            except ValueError as e:
-                return False
-            # next_token = data.get('paging', {}).get('cursors',{}).get('after')
             try:
                 next_token = self.__tokens.pop()
             except IndexError:
                 poll_continue = False
             else:
                 print(next_token)
-            if len(data.get('data', [])) == 0:
-                poll_continue = False
-            else:
-                print('This batch is %s long'%len(data.get('data', [])))
-                self.__count += len(data.get('data', []))
-                self.kick_the_bucket(data.get('data', []))
-            params['after'] = next_token
-            self.check_app_usage(x)
-            if self.__count % 1000 == 0:
-                delta = time() - start
-                start = time()
-                print('Count: %s, Time for 1k: %ss' % (count, delta))
-                print('Delay: %s' % delay)
-                print('Current usage: calls: %s cpu: %s time: %s' % tuple(self.usage))
+                self.get_comments_batch(next_token)
         print('Total records processed: %s' % self.__count)
         return self.time_series
 
+    def get_comments_batch(self, token) -> Union[bool, None]:
+        """fetches comments by token and the sends them to processing
 
-    def kick_the_bucket(self, records):
+        :param token:
+        :return:
+        """
+        start = time()
+        params = {
+            'access_token': API_KEY,
+            'limit': BATCH_SIZE,
+            'after': token
+        }
+        x = requests.get(url, params=params)
+        try:
+            data = loads(x.content)
+        except ValueError as e:
+            return False
+        if len(data.get('data', [])) == 0:
+            return False
+        else:
+            print('This batch is %s long' % len(data.get('data', [])))
+            self.__count += len(data.get('data', []))
+            self.kick_the_bucket(data.get('data', []))
+        self.check_app_usage(x)
 
+    def kick_the_bucket(self, records) -> None:
         # Yeah, I know that it's more flexible to use timestamp etc, but resource-wise this approach is easier
         # because converting each datetime to timestamp, dividing... etc is much less efficient
         duplicates = 0
@@ -120,7 +132,9 @@ class GetFBTimeseries(object):
         self.__count -= duplicates
         print('Found duplicates : %s' % duplicates)
 
-    def zerofill_timeseries(self):
+    def zerofill_timeseries(self) -> None:
+        """fills non existent buckets between start and finish with zeroes
+        """
         start = sorted(self.time_series)[0]
         finish = sorted(self.time_series)[-1]
         delta = timedelta(minutes=BUCKET_SIZE)
@@ -130,8 +144,9 @@ class GetFBTimeseries(object):
                 self.time_series[cursor] = 0
             cursor += delta
 
-
-    def format_time_series(self):
+    def format_timeseries(self) -> List[Tuple[str, int, str, str]]:
+        """prepares timeseries for graph plotting
+        """
         self.zerofill_timeseries()
         matrix = []
         for dt, value in sorted(self.time_series.items()):
@@ -141,14 +156,14 @@ class GetFBTimeseries(object):
             )
         return matrix
 
-
-
-    def check_app_usage(self, request):
+    def check_app_usage(self, request: Request) -> None:
+        """Gets data from request and checks if values are nearing threshold, and if so -> increases delay
+        """
         header = request.headers.get('x-app-usage', '{}')
         try:
             data = loads(header)
         except ValueError as e:
-            return 0
+            return
         correct_delay = False
         for val in data.values():
             if val >= USAGE_THRESHOLD:
@@ -157,7 +172,7 @@ class GetFBTimeseries(object):
         self.usage[1] = data['total_cputime']
         self.usage[2] = data['total_time']
         if not correct_delay:
-            return False
+            return
         if self.delay == 0:
             self.delay = 0.1
         else:
@@ -169,6 +184,5 @@ processor = GetFBTimeseries()
 count = processor.get_comment_count()
 print("Initial count: %s" % count)
 processor.get_posts()
-matrix = processor.format_time_series()
+matrix = processor.format_timeseries()
 generate_graph(matrix)
-
