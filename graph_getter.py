@@ -1,9 +1,10 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from json import loads
 from time import time
-from collections import deque
+from collections import deque, OrderedDict
 from base64 import b64encode
 import requests
+from graph_generator import generate_graph
 # import matplotlib.pyplot as plt
 
 API_KEY = 'EAACEdEose0cBAAHkVLbW94CEDLC0E5UwzwrMZC73Te6rsI6zZAKI7rihUA3MAQ1KGKQ7JHFVgJTJo8TZBzZAmVnQZBNSIThzZCho6UVFhbbCFsiAiZBpafCQ8UJ88wxQvIYr0IX6rAQDlB4xtDDdnDhqDSEMw8F08Qo4BU1CsYJlrPTjuTGOVlaN7hwNQ3Ori4ZD'
@@ -97,6 +98,7 @@ class GetFBTimeseries(object):
                 print('Delay: %s' % delay)
                 print('Current usage: calls: %s cpu: %s time: %s' % tuple(self.usage))
         print('Total records processed: %s' % self.__count)
+        return self.time_series
 
 
     def kick_the_bucket(self, records):
@@ -117,6 +119,27 @@ class GetFBTimeseries(object):
                 duplicates += 1
         self.__count -= duplicates
         print('Found duplicates : %s' % duplicates)
+
+    def zerofill_timeseries(self):
+        start = sorted(self.time_series)[0]
+        finish = sorted(self.time_series)[-1]
+        delta = timedelta(minutes=BUCKET_SIZE)
+        cursor = start
+        while cursor < finish:
+            if cursor not in self.time_series:
+                self.time_series[cursor] = 0
+            cursor += delta
+
+
+    def format_time_series(self):
+        self.zerofill_timeseries()
+        matrix = []
+        for dt, value in sorted(self.time_series.items()):
+            str_date = dt.strftime(FACEBOOK_DATE_FORMAT)
+            matrix.append(
+                (str_date, value, '#EAA228', value)
+            )
+        return matrix
 
 
 
@@ -146,3 +169,6 @@ processor = GetFBTimeseries()
 count = processor.get_comment_count()
 print("Initial count: %s" % count)
 processor.get_posts()
+matrix = processor.format_time_series()
+generate_graph(matrix)
+
