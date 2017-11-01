@@ -2,3 +2,4 @@ requests
 aiohttp
 fire
 plotly
+mock

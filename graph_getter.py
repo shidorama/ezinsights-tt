@@ -7,7 +7,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from json import loads
 from time import time
-from typing import Dict, Union
+from typing import Dict, Union, List
 
 import aiohttp
 import fire
@@ -35,7 +35,7 @@ MAX_RETRY = 5
 
 
 class GetFBTimeseries(object):
-    def __init__(self, object_id, access_token):
+    def __init__(self, object_id: int, access_token: str) -> None:
         self.delay = 0
         self.usage = [0, 0, 0]
         self.__total = None
@@ -167,8 +167,8 @@ class GetFBTimeseries(object):
                 logger.warning('Retrying request %s' % retry)
                 retry += 1
                 asyncio.ensure_future(self.get_comments_batch(token, session, retry))
-
-    def process_error(self, status, headers, data):
+    @staticmethod
+    def process_error(status: int, headers: Dict, data: Dict) -> None:
         e_code = data['error'].get('code')
         e_type = data['error'].get('type')
         e_msg = data['error'].get('message')
@@ -176,7 +176,7 @@ class GetFBTimeseries(object):
             if e_code == 100 and e_type == 'OAuthException':
                 logger.warning('Some comments are unavailible. Probably because there are more than 24k')
 
-    def push_to_bucket(self, records) -> None:
+    def push_to_bucket(self, records: List[Dict]) -> None:
         """gets data into timeseries storage
 
         :param records:
@@ -208,11 +208,6 @@ class GetFBTimeseries(object):
             delta = timedelta(hours=12)
         elif BUCKET_SIZE == SIZE_DAY:
             delta = timedelta(days=1)
-        # elif BUCKET_SIZE == SIZE_MONTH:
-        #     delta = timedelta(month)
-        # elif BUCKET_SIZE == SIZE_DAY:
-        #     delta = timedelta(days=1)
-        # delta = timedelta(minutes=)
         cursor = start
         while cursor < finish:
             if cursor not in self.time_series:
@@ -261,19 +256,19 @@ class GetFBTimeseries(object):
             self.delay *= 2
 
 
-def generate_graph(data, filename):
+def generate_graph(data: Dict, filename: str) -> None:
     logger.info('Start timeseries render')
     generate_html_graph(data, filename)
     logger.info('Finished rendering')
 
 
-def generate_html_graph(data, filename):
+def generate_html_graph(data: Dict, filename: str) -> None:
     data['orientation'] = 'h'
     graph_data = [plotly.graph_objs.Bar(data)]
     plotly.offline.plot(graph_data, filename=filename)
 
 
-async def form_graph(id, token, filename):
+async def form_graph(id: int, token: str, filename: str):
     processor = GetFBTimeseries(id, token)
     await processor.get_posts()
     matrix = processor.format_timeseries()
