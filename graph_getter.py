@@ -1,38 +1,73 @@
+#!/usr/bin/env python
+import asyncio
+import socket
 from base64 import b64encode
 from collections import deque
 from datetime import datetime, timedelta
 from json import loads
 from time import time
-from typing import List, Tuple, Dict, Union
+from typing import Dict, Union
+import logging
 
+import aiohttp
+import fire
+import pygal
 import requests
 from requests import Request
 
-from graph_generator import generate_graph
+SIZE_HOUR = 0
+SIZE_6HOURS = 1
+SIZE_12HOURS = 2
+SIZE_DAY = 3
 
-# import matplotlib.pyplot as plt
+logging.basicConfig(format=u'%(filename)s[LINE:%(lineno)d]# %(levelname)-8s [%(asctime)s]  %(message)s')
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
-API_KEY = 'EAACEdEose0cBAAHkVLbW94CEDLC0E5UwzwrMZC73Te6rsI6zZAKI7rihUA3MAQ1KGKQ7JHFVgJTJo8TZBzZAmVnQZBNSIThzZCho6UVFhbbCFsiAiZBpafCQ8UJ88wxQvIYr0IX6rAQDlB4xtDDdnDhqDSEMw8F08Qo4BU1CsYJlrPTjuTGOVlaN7hwNQ3Ori4ZD'
-# ID = 10151775534413086
-ID = 10155660730655097
+# BIG ID: 10151775534413086, SMALL: 10155660730655097
 BASE_URL = 'https://graph.facebook.com/v2.10/'
 FACEBOOK_DATE_FORMAT = '%Y-%m-%dT%H:%M:%S%z'
 USAGE_THRESHOLD = 80
-BUCKET_SIZE = 30
+BUCKET_SIZE = SIZE_DAY
 BATCH_SIZE = 1000
-
-url = '%s%s/comments' % (BASE_URL, ID)
+MAX_RETRY = 5
 
 
 class GetFBTimeseries(object):
-    def __init__(self):
+    def __init__(self, object_id, access_token):
         self.delay = 0
         self.usage = [0, 0, 0]
         self.__total = None
         self.time_series = {}
         self.__tokens = deque()
+        self.__exec_queue = set()
         self.__duplicates_check = set()
         self.__count = 0
+        self.__id = object_id
+        self.__access_token = access_token
+        self.__url = '%s%s/comments' % (BASE_URL, self.__id)
+
+    @staticmethod
+    def get_bucket_slot(raw_time: str) -> datetime:
+        """determine under which key this result should be stored based on bucket size
+
+        :param raw_time: timestamp string from facebook
+        :return: bucket key
+        """
+        parsed_time = datetime.strptime(raw_time, FACEBOOK_DATE_FORMAT)
+        params = {
+            'second': 0,
+            'microsecond': 0,
+            'minute': 0
+        }
+        if BUCKET_SIZE == SIZE_6HOURS:
+            params['hour'] = parsed_time.hour - (parsed_time.hour % 6)
+        elif BUCKET_SIZE == SIZE_12HOURS:
+            params['hour'] = parsed_time.hour - (parsed_time.hour % 6)
+        elif BUCKET_SIZE == SIZE_DAY:
+            params['hour'] = 0
+        bucket_time = parsed_time.replace(**params)
+        return bucket_time
 
     @property
     def total(self) -> int:
@@ -59,10 +94,12 @@ class GetFBTimeseries(object):
 
     def get_comment_count(self) -> Union[int, bool]:
         params = {
-            'access_token': API_KEY,
+            'access_token': self.__access_token,
             'summary': True
         }
-        x = requests.get(url, params=params)
+        x = requests.get(self.__url, params=params)
+        if x.status_code != 200:
+            raise ConnectionError('Server returned non 200 response. Check your token.')
         try:
             data = loads(x.content)
         except ValueError as e:
@@ -70,67 +107,91 @@ class GetFBTimeseries(object):
         count = data.get('summary', {}).get('total_count', False)
         return count
 
-    def get_posts(self) -> Dict[datetime: int]:
+    async def get_posts(self) -> Dict[datetime, int]:
         """Iterates over tokens and calls actual comment fetcher
 
         :return:
         """
-        self.generate_tokens()
         poll_continue = True
         delay = 0
-        while poll_continue:
-            try:
-                next_token = self.__tokens.pop()
-            except IndexError:
-                poll_continue = False
-            else:
-                print(next_token)
-                self.get_comments_batch(next_token)
-        print('Total records processed: %s' % self.__count)
+        tasks = []
+        conn = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            verify_ssl=False,
+        )
+        async with aiohttp.ClientSession(loop=loop, connector=conn) as session:
+            self.generate_tokens()
+            for token in self.__tokens:
+                task = asyncio.ensure_future(self.get_comments_batch(token, session))
+                tasks.append(task)
+            await asyncio.wait(tasks)
+
+        logger.info('Total records processed: %s' % self.__count)
         return self.time_series
 
-    def get_comments_batch(self, token) -> Union[bool, None]:
+    async def get_comments_batch(self, token, session: aiohttp.ClientSession, retry: int = 0) -> Union[bool, None]:
         """fetches comments by token and the sends them to processing
 
         :param token:
+        :param session:
+        :param retry:
         :return:
         """
         start = time()
         params = {
-            'access_token': API_KEY,
+            'access_token': self.__access_token,
             'limit': BATCH_SIZE,
             'after': token
         }
-        x = requests.get(url, params=params)
+        await asyncio.sleep(self.delay)
         try:
-            data = loads(x.content)
-        except ValueError as e:
-            return False
-        if len(data.get('data', [])) == 0:
-            return False
-        else:
-            print('This batch is %s long' % len(data.get('data', [])))
-            self.__count += len(data.get('data', []))
-            self.kick_the_bucket(data.get('data', []))
-        self.check_app_usage(x)
+            async with session.get(self.__url, params=params) as req:
+                data = await req.json()
+                if len(data.get('data', [])) == 0:
+                    if 'error' in data:
+                        self.process_error(req.status, req.headers, data)
+                    # self.__exec_queue.remove(token)
+                    logger.warning('No data!')
+                    return False
+                else:
+                    logger.debug('This batch is %s long' % len(data.get('data', [])))
+                    self.__count += len(data.get('data', []))
+                    self.push_to_bucket(data.get('data', []))
+                self.check_app_usage(req)
+        except OSError as e:
+            if retry < MAX_RETRY:
+                logger.warning('Retrying request %s' % retry)
+                retry += 1
+                asyncio.ensure_future(self.get_comments_batch(token, session, retry))
 
-    def kick_the_bucket(self, records) -> None:
-        # Yeah, I know that it's more flexible to use timestamp etc, but resource-wise this approach is easier
-        # because converting each datetime to timestamp, dividing... etc is much less efficient
+    def process_error(self, status, headers, data):
+        e_code = data['error'].get('code')
+        e_type = data['error'].get('type')
+        e_msg = data['error'].get('message')
+        if status == 400:
+            if e_code == 100 and e_type == 'OAuthException':
+                logger.warning('Some comments are unavailible. Probably because there are more than 24k')
+
+
+
+    def push_to_bucket(self, records) -> None:
+        """gets data into timeseries storage
+
+        :param records:
+        :return:
+        """
         duplicates = 0
         for record in records:
             rec_id = record.get('id')
             if rec_id not in self.__duplicates_check:
                 raw_time = record.get('created_time')
-                parsed_time = datetime.strptime(raw_time, FACEBOOK_DATE_FORMAT)
-                bucket_minutes = parsed_time.minute - (parsed_time.minute % BUCKET_SIZE)
-                bucket_time = parsed_time.replace(minute=bucket_minutes, second=0, microsecond=0)
+                bucket_time = self.get_bucket_slot(raw_time)
                 self.time_series[bucket_time] = self.time_series.get(bucket_time, 0) + 1
                 self.__duplicates_check.add(rec_id)
             else:
                 duplicates += 1
         self.__count -= duplicates
-        print('Found duplicates : %s' % duplicates)
+        logger.debug('Found duplicates : %s' % duplicates)
 
     def zerofill_timeseries(self) -> None:
         """fills non existent buckets between start and finish with zeroes
@@ -144,20 +205,24 @@ class GetFBTimeseries(object):
                 self.time_series[cursor] = 0
             cursor += delta
 
-    def format_timeseries(self) -> List[Tuple[str, int, str, str]]:
+    def format_timeseries(self) -> Dict:
         """prepares timeseries for graph plotting
         """
         self.zerofill_timeseries()
-        matrix = []
+        matrix = {
+            'x': [],
+            'y': []
+        }
         for dt, value in sorted(self.time_series.items()):
             str_date = dt.strftime(FACEBOOK_DATE_FORMAT)
-            matrix.append(
-                (str_date, value, '#EAA228', value)
-            )
+            matrix['x'].append(value)
+            matrix['y'].append(str_date)
         return matrix
 
     def check_app_usage(self, request: Request) -> None:
         """Gets data from request and checks if values are nearing threshold, and if so -> increases delay
+
+        :param request: request object which is used to get headers from it
         """
         header = request.headers.get('x-app-usage', '{}')
         try:
@@ -168,9 +233,10 @@ class GetFBTimeseries(object):
         for val in data.values():
             if val >= USAGE_THRESHOLD:
                 correct_delay = True
-        self.usage[0] = data['call_count']
-        self.usage[1] = data['total_cputime']
-        self.usage[2] = data['total_time']
+        self.usage[0] = data.get('call_count')
+        self.usage[1] = data.get('total_cputime')
+        self.usage[2] = data.get('total_time')
+        logger.info('Usage %s-%s-%s' % tuple(self.usage))
         if not correct_delay:
             return
         if self.delay == 0:
@@ -179,10 +245,39 @@ class GetFBTimeseries(object):
             self.delay *= 2
 
 
-processor = GetFBTimeseries()
+def generate_graph(data, filename):
+    logger.info('Start timeseries render')
+    bars = pygal.Bar()
+    bars.x_labels = data['y']
+    bars.add('Comments', data['x'])
+    bars.render_to_png(filename, dpi=10)
+    logger.info('Finished rendering')
 
-count = processor.get_comment_count()
-print("Initial count: %s" % count)
-processor.get_posts()
-matrix = processor.format_timeseries()
-generate_graph(matrix)
+
+async def form_graph(id, token, filename):
+    processor = GetFBTimeseries(id, token)
+    await processor.get_posts()
+    matrix = processor.format_timeseries()
+    generate_graph(matrix, filename)
+
+
+def cli_wrapper(**kwargs):
+    required_params = {'id', 'token', 'filename'}
+    show_help = False
+    if set(kwargs.keys()) != required_params:
+        show_help = True
+    if not show_help:
+        id = int(kwargs.get('id'))
+        token = kwargs.get('token')
+        filename = kwargs.get('filename')
+        try:
+            loop.run_until_complete(form_graph(id, token, filename))
+        finally:
+            loop.close()
+    else:
+        print('Please supply parameters: --id, --token, --filename')
+
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    fire.Fire(cli_wrapper)
