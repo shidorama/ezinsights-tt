@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import asyncio
+import logging
 import socket
 from base64 import b64encode
 from collections import deque
@@ -7,11 +8,10 @@ from datetime import datetime, timedelta
 from json import loads
 from time import time
 from typing import Dict, Union
-import logging
 
 import aiohttp
 import fire
-import pygal
+import plotly
 import requests
 from requests import Request
 
@@ -19,6 +19,7 @@ SIZE_HOUR = 0
 SIZE_6HOURS = 1
 SIZE_12HOURS = 2
 SIZE_DAY = 3
+SIZE_MONTH = 4  # Not working
 
 logging.basicConfig(format=u'%(filename)s[LINE:%(lineno)d]# %(levelname)-8s [%(asctime)s]  %(message)s')
 logger = logging.getLogger(__name__)
@@ -66,6 +67,10 @@ class GetFBTimeseries(object):
             params['hour'] = parsed_time.hour - (parsed_time.hour % 6)
         elif BUCKET_SIZE == SIZE_DAY:
             params['hour'] = 0
+        elif BUCKET_SIZE == SIZE_MONTH:
+            params['hour'] = 0
+            params['day'] = 1
+
         bucket_time = parsed_time.replace(**params)
         return bucket_time
 
@@ -150,7 +155,6 @@ class GetFBTimeseries(object):
                 if len(data.get('data', [])) == 0:
                     if 'error' in data:
                         self.process_error(req.status, req.headers, data)
-                    # self.__exec_queue.remove(token)
                     logger.warning('No data!')
                     return False
                 else:
@@ -171,8 +175,6 @@ class GetFBTimeseries(object):
         if status == 400:
             if e_code == 100 and e_type == 'OAuthException':
                 logger.warning('Some comments are unavailible. Probably because there are more than 24k')
-
-
 
     def push_to_bucket(self, records) -> None:
         """gets data into timeseries storage
@@ -198,7 +200,19 @@ class GetFBTimeseries(object):
         """
         start = sorted(self.time_series)[0]
         finish = sorted(self.time_series)[-1]
-        delta = timedelta(minutes=BUCKET_SIZE)
+        if BUCKET_SIZE == SIZE_HOUR:
+            delta = timedelta(hours=1)
+        elif BUCKET_SIZE == SIZE_6HOURS:
+            delta = timedelta(hours=6)
+        elif BUCKET_SIZE == SIZE_12HOURS:
+            delta = timedelta(hours=12)
+        elif BUCKET_SIZE == SIZE_DAY:
+            delta = timedelta(days=1)
+        # elif BUCKET_SIZE == SIZE_MONTH:
+        #     delta = timedelta(month)
+        # elif BUCKET_SIZE == SIZE_DAY:
+        #     delta = timedelta(days=1)
+        # delta = timedelta(minutes=)
         cursor = start
         while cursor < finish:
             if cursor not in self.time_series:
@@ -208,7 +222,9 @@ class GetFBTimeseries(object):
     def format_timeseries(self) -> Dict:
         """prepares timeseries for graph plotting
         """
+        logger.info('Timeseries size (pre ZF) is %s' % len(self.time_series))
         self.zerofill_timeseries()
+        logger.info('Timeseries size (aftera ZF) is %s' % len(self.time_series))
         matrix = {
             'x': [],
             'y': []
@@ -247,11 +263,14 @@ class GetFBTimeseries(object):
 
 def generate_graph(data, filename):
     logger.info('Start timeseries render')
-    bars = pygal.Bar()
-    bars.x_labels = data['y']
-    bars.add('Comments', data['x'])
-    bars.render_to_png(filename, dpi=10)
+    generate_html_graph(data, filename)
     logger.info('Finished rendering')
+
+
+def generate_html_graph(data, filename):
+    data['orientation'] = 'h'
+    graph_data = [plotly.graph_objs.Bar(data)]
+    plotly.offline.plot(graph_data, filename=filename)
 
 
 async def form_graph(id, token, filename):

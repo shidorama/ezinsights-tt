@@ -1,5 +1,4 @@
 requests
 aiohttp
 fire
-pygal
-cairosvg
+plotly
